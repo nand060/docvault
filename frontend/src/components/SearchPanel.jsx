@@ -77,7 +77,7 @@ function EmptySearchState() {
     <div className="search-output idle empty-search-state">
       <SearchX size={32} />
       <strong>No documents matched your query.</strong>
-      <span>Try a more specific term from one of your uploaded files.</span>
+      <span>Try a more specific term from one of your uploaded files or check your spelling.</span>
     </div>
   );
 }
