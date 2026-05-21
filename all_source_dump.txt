@@ -1,0 +1,2609 @@
+FILE: backend/src/main/java/com/yourname/docvault/DocvaultApplication.java
+================================================================================
+package com.yourname.docvault;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class DocvaultApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(DocvaultApplication.class, args);
+    }
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/websocket/SocketEvent.java
+================================================================================
+package com.yourname.docvault.websocket;
+
+public record SocketEvent(String type, Object payload) {
+    public static SocketEvent of(String type, Object payload) {
+        return new SocketEvent(type, payload);
+    }
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/websocket/WebSocketConfig.java
+================================================================================
+package com.yourname.docvault.websocket;
+
+import com.yourname.docvault.auth.JwtService;
+import com.yourname.docvault.auth.UserPrincipal;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.messaging.Message;
+import org.springframework.messaging.MessageChannel;
+import org.springframework.messaging.simp.config.ChannelRegistration;
+import org.springframework.messaging.simp.config.MessageBrokerRegistry;
+import org.springframework.messaging.simp.stomp.StompCommand;
+import org.springframework.messaging.simp.stomp.StompHeaderAccessor;
+import org.springframework.messaging.support.ChannelInterceptor;
+import org.springframework.messaging.support.MessageHeaderAccessor;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.web.socket.config.annotation.EnableWebSocketMessageBroker;
+import org.springframework.web.socket.config.annotation.StompEndpointRegistry;
+import org.springframework.web.socket.config.annotation.WebSocketMessageBrokerConfigurer;
+
+import java.security.Principal;
+import java.util.List;
+
+@Configuration
+@EnableWebSocketMessageBroker
+public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
+    private final JwtService jwtService;
+    private final String allowedOrigins;
+
+    public WebSocketConfig(JwtService jwtService, @Value("${app.cors.allowed-origins}") String allowedOrigins) {
+        this.jwtService = jwtService;
+        this.allowedOrigins = allowedOrigins;
+    }
+
+    @Override
+    public void configureMessageBroker(MessageBrokerRegistry registry) {
+        registry.enableSimpleBroker("/topic");
+        registry.setApplicationDestinationPrefixes("/app");
+    }
+
+    @Override
+    public void registerStompEndpoints(StompEndpointRegistry registry) {
+        registry.addEndpoint("/ws")
+                .setAllowedOrigins(allowedOrigins.split(","))
+                .withSockJS();
+    }
+
+    @Override
+    public void configureClientInboundChannel(ChannelRegistration registration) {
+        registration.interceptors(new ChannelInterceptor() {
+            @Override
+            public Message<?> preSend(Message<?> message, MessageChannel channel) {
+                StompHeaderAccessor accessor = MessageHeaderAccessor.getAccessor(message, StompHeaderAccessor.class);
+                if (accessor == null || accessor.getCommand() == null) {
+                    return message;
+                }
+
+                if (StompCommand.CONNECT.equals(accessor.getCommand())) {
+                    String authHeader = firstNativeHeader(accessor, "Authorization");
+                    if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+                        throw new AccessDeniedException("Missing websocket JWT");
+                    }
+                    UserPrincipal principal = jwtService.parseToken(authHeader.substring(7));
+                    accessor.setUser(new SocketPrincipal(principal.id(), principal.username()));
+                }
+
+                if (StompCommand.SUBSCRIBE.equals(accessor.getCommand())) {
+                    Principal principal = accessor.getUser();
+                    String destination = accessor.getDestination();
+                    if (principal == null || destination == null || !ownsTopic(principal.getName(), destination)) {
+                        throw new AccessDeniedException("Cannot subscribe to another user's topic");
+                    }
+                }
+                return message;
+            }
+        });
+    }
+
+    private String firstNativeHeader(StompHeaderAccessor accessor, String name) {
+        List<String> values = accessor.getNativeHeader(name);
+        return values == null || values.isEmpty() ? null : values.get(0);
+    }
+
+    private boolean ownsTopic(String userId, String destination) {
+        return destination.equals("/topic/upload-progress/" + userId)
+                || destination.equals("/topic/search-results/" + userId);
+    }
+
+    private record SocketPrincipal(Long id, String username) implements Principal {
+        @Override
+        public String getName() {
+            return id.toString();
+        }
+    }
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/file/FileController.java
+================================================================================
+package com.yourname.docvault.file;
+
+import com.yourname.docvault.auth.CurrentUser;
+import com.yourname.docvault.auth.UserPrincipal;
+import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.DeleteMapping;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.ResponseStatus;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/files")
+public class FileController {
+    private final FileService fileService;
+
+    public FileController(FileService fileService) {
+        this.fileService = fileService;
+    }
+
+    @PostMapping("/upload")
+    public FileResponse upload(@CurrentUser UserPrincipal principal, @RequestParam("file") MultipartFile file) {
+        return fileService.upload(principal.id(), file);
+    }
+
+    @GetMapping
+    public List<FileResponse> list(@CurrentUser UserPrincipal principal) {
+        return fileService.list(principal.id());
+    }
+
+    @DeleteMapping("/{id}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void delete(@CurrentUser UserPrincipal principal, @PathVariable Long id) {
+        fileService.delete(principal.id(), id);
+    }
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/file/FileEntity.java
+================================================================================
+package com.yourname.docvault.file;
+
+import com.yourname.docvault.user.User;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.FetchType;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.JoinColumn;
+import jakarta.persistence.ManyToOne;
+import jakarta.persistence.PrePersist;
+import jakarta.persistence.Table;
+
+import java.time.Instant;
+
+@Entity
+@Table(name = "files")
+public class FileEntity {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(name = "user_id", nullable = false)
+    private User user;
+
+    @Column(nullable = false)
+    private String name;
+
+    @Column(nullable = false, columnDefinition = "TEXT")
+    private String content;
+
+    @Column(name = "uploaded_at", nullable = false, updatable = false)
+    private Instant uploadedAt;
+
+    public Long getId() {
+        return id;
+    }
+
+    public void setId(Long id) {
+        this.id = id;
+    }
+
+    public User getUser() {
+        return user;
+    }
+
+    public void setUser(User user) {
+        this.user = user;
+    }
+
+    public String getName() {
+        return name;
+    }
+
+    public void setName(String name) {
+        this.name = name;
+    }
+
+    public String getContent() {
+        return content;
+    }
+
+    public void setContent(String content) {
+        this.content = content;
+    }
+
+    public Instant getUploadedAt() {
+        return uploadedAt;
+    }
+
+    @PrePersist
+    void onCreate() {
+        this.uploadedAt = Instant.now();
+    }
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/file/FileRepository.java
+================================================================================
+package com.yourname.docvault.file;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+
+import java.util.List;
+import java.util.Optional;
+
+public interface FileRepository extends JpaRepository<FileEntity, Long> {
+    List<FileEntity> findAllByUserIdOrderByUploadedAtDesc(Long userId);
+
+    Optional<FileEntity> findByIdAndUserId(Long id, Long userId);
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/file/FileResponse.java
+================================================================================
+package com.yourname.docvault.file;
+
+import java.time.Instant;
+
+public record FileResponse(Long id, String name, Instant uploadedAt) {
+    public static FileResponse from(FileEntity file) {
+        return new FileResponse(file.getId(), file.getName(), file.getUploadedAt());
+    }
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/file/FileService.java
+================================================================================
+package com.yourname.docvault.file;
+
+import com.yourname.docvault.common.ApiException;
+import com.yourname.docvault.external.HuggingFaceClient;
+import com.yourname.docvault.user.User;
+import com.yourname.docvault.user.UserService;
+import com.yourname.docvault.websocket.SocketEvent;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
+import org.springframework.messaging.simp.SimpMessagingTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+
+@Service
+public class FileService {
+    private static final Logger log = LoggerFactory.getLogger(FileService.class);
+
+    private final FileRepository fileRepository;
+    private final FileVectorRepository fileVectorRepository;
+    private final UserService userService;
+    private final HuggingFaceClient huggingFaceClient;
+    private final SimpMessagingTemplate messagingTemplate;
+    private final long maxSizeBytes;
+
+    public FileService(
+            FileRepository fileRepository,
+            FileVectorRepository fileVectorRepository,
+            UserService userService,
+            HuggingFaceClient huggingFaceClient,
+            SimpMessagingTemplate messagingTemplate,
+            @Value("${app.files.max-size-bytes}") long maxSizeBytes
+    ) {
+        this.fileRepository = fileRepository;
+        this.fileVectorRepository = fileVectorRepository;
+        this.userService = userService;
+        this.huggingFaceClient = huggingFaceClient;
+        this.messagingTemplate = messagingTemplate;
+        this.maxSizeBytes = maxSizeBytes;
+    }
+
+    @Transactional
+    public FileResponse upload(Long userId, MultipartFile multipartFile) {
+        validateUpload(multipartFile);
+        sendProgress(userId, "uploading", "Uploading file");
+
+        User user = userService.requireUser(userId);
+        String content = readContent(multipartFile);
+
+        FileEntity file = new FileEntity();
+        file.setUser(user);
+        file.setName(safeName(multipartFile.getOriginalFilename()));
+        file.setContent(content);
+        FileEntity saved = fileRepository.saveAndFlush(file);
+        sendProgress(userId, "embedding", "Generating embedding");
+
+        List<Double> embedding = huggingFaceClient.embed(content);
+        fileVectorRepository.insertVector(saved.getId(), embedding);
+
+        log.info("Uploaded file {} for user {}", saved.getId(), userId);
+        sendProgress(userId, "done", "Done");
+        return FileResponse.from(saved);
+    }
+
+    @Transactional(readOnly = true)
+    public List<FileResponse> list(Long userId) {
+        return fileRepository.findAllByUserIdOrderByUploadedAtDesc(userId).stream()
+                .map(FileResponse::from)
+                .toList();
+    }
+
+    @Transactional
+    public void delete(Long userId, Long fileId) {
+        FileEntity file = fileRepository.findByIdAndUserId(fileId, userId)
+                .orElseThrow(() -> new ApiException("File not found", HttpStatus.NOT_FOUND));
+        fileRepository.delete(file);
+        log.info("Deleted file {} for user {}", fileId, userId);
+    }
+
+    private void validateUpload(MultipartFile file) {
+        if (file == null || file.isEmpty()) {
+            throw new ApiException("A .txt file is required", HttpStatus.BAD_REQUEST);
+        }
+        String name = safeName(file.getOriginalFilename());
+        if (!name.toLowerCase().endsWith(".txt")) {
+            throw new ApiException("Only .txt files are supported", HttpStatus.BAD_REQUEST);
+        }
+        if (file.getSize() > maxSizeBytes) {
+            throw new ApiException("File exceeds the 1MB upload limit", HttpStatus.PAYLOAD_TOO_LARGE);
+        }
+    }
+
+    private String readContent(MultipartFile file) {
+        try {
+            return new String(file.getBytes(), StandardCharsets.UTF_8);
+        } catch (IOException ex) {
+            throw new ApiException("Could not read uploaded file", HttpStatus.BAD_REQUEST);
+        }
+    }
+
+    private String safeName(String originalFilename) {
+        if (originalFilename == null || originalFilename.isBlank()) {
+            return "upload.txt";
+        }
+        return originalFilename.replaceAll("[\\\\/]+", "_");
+    }
+
+    private void sendProgress(Long userId, String type, String message) {
+        messagingTemplate.convertAndSend(
+                "/topic/upload-progress/" + userId,
+                SocketEvent.of(type, message)
+        );
+    }
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/file/FileVectorRepository.java
+================================================================================
+package com.yourname.docvault.file;
+
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
+@Repository
+public class FileVectorRepository {
+    private final JdbcTemplate jdbcTemplate;
+
+    public FileVectorRepository(JdbcTemplate jdbcTemplate) {
+        this.jdbcTemplate = jdbcTemplate;
+    }
+
+    public void insertVector(Long fileId, List<Double> embedding) {
+        jdbcTemplate.update(
+                "INSERT INTO file_vectors (file_id, embedding) VALUES (?, CAST(? AS vector))",
+                fileId,
+                toVectorLiteral(embedding)
+        );
+    }
+
+    public static String toVectorLiteral(List<Double> embedding) {
+        StringBuilder builder = new StringBuilder("[");
+        for (int i = 0; i < embedding.size(); i++) {
+            if (i > 0) {
+                builder.append(',');
+            }
+            builder.append(embedding.get(i));
+        }
+        return builder.append(']').toString();
+    }
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/auth/AuthController.java
+================================================================================
+package com.yourname.docvault.auth;
+
+import jakarta.validation.Valid;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@RequestMapping("/api/auth")
+public class AuthController {
+    private final AuthService authService;
+
+    public AuthController(AuthService authService) {
+        this.authService = authService;
+    }
+
+    @PostMapping("/register")
+    public AuthResponse register(@Valid @RequestBody AuthRequests.RegisterRequest request) {
+        return authService.register(request.username(), request.password());
+    }
+
+    @PostMapping("/login")
+    public AuthResponse login(@Valid @RequestBody AuthRequests.LoginRequest request) {
+        return authService.login(request.username(), request.password());
+    }
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/auth/AuthRequests.java
+================================================================================
+package com.yourname.docvault.auth;
+
+import jakarta.validation.constraints.Email;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
+
+public final class AuthRequests {
+    private AuthRequests() {
+    }
+
+    public record RegisterRequest(
+            @Email @NotBlank String username,
+            @Size(min = 8, max = 100) String password
+    ) {
+    }
+
+    public record LoginRequest(
+            @Email @NotBlank String username,
+            @NotBlank String password
+    ) {
+    }
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/auth/AuthResponse.java
+================================================================================
+package com.yourname.docvault.auth;
+
+public record AuthResponse(String token, Long userId, String username, boolean aiAccess) {
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/auth/AuthService.java
+================================================================================
+package com.yourname.docvault.auth;
+
+import com.yourname.docvault.common.ApiException;
+import com.yourname.docvault.user.User;
+import com.yourname.docvault.user.UserRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpStatus;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class AuthService {
+    private static final Logger log = LoggerFactory.getLogger(AuthService.class);
+
+    private final UserRepository userRepository;
+    private final PasswordEncoder passwordEncoder;
+    private final JwtService jwtService;
+
+    public AuthService(UserRepository userRepository, PasswordEncoder passwordEncoder, JwtService jwtService) {
+        this.userRepository = userRepository;
+        this.passwordEncoder = passwordEncoder;
+        this.jwtService = jwtService;
+    }
+
+    @Transactional
+    public AuthResponse register(String username, String password) {
+        String normalizedUsername = username.trim().toLowerCase();
+        if (userRepository.existsByUsername(normalizedUsername)) {
+            throw new ApiException("Username already registered", HttpStatus.CONFLICT);
+        }
+
+        User user = new User();
+        user.setUsername(normalizedUsername);
+        user.setPassword(passwordEncoder.encode(password));
+        user.setAiAccess(false);
+        User saved = userRepository.save(user);
+        log.info("Registered user {}", saved.getId());
+        return responseFor(saved);
+    }
+
+    @Transactional(readOnly = true)
+    public AuthResponse login(String username, String password) {
+        String normalizedUsername = username.trim().toLowerCase();
+        User user = userRepository.findByUsername(normalizedUsername)
+                .orElseThrow(() -> new ApiException("Invalid credentials", HttpStatus.UNAUTHORIZED));
+        if (!passwordEncoder.matches(password, user.getPassword())) {
+            throw new ApiException("Invalid credentials", HttpStatus.UNAUTHORIZED);
+        }
+        log.info("User {} logged in", user.getId());
+        return responseFor(user);
+    }
+
+    private AuthResponse responseFor(User user) {
+        return new AuthResponse(
+                jwtService.generateToken(user.getId(), user.getUsername()),
+                user.getId(),
+                user.getUsername(),
+                user.isAiAccess()
+        );
+    }
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/auth/CurrentUser.java
+================================================================================
+package com.yourname.docvault.auth;
+
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+
+@Target({ElementType.PARAMETER, ElementType.TYPE})
+@Retention(RetentionPolicy.RUNTIME)
+@AuthenticationPrincipal
+public @interface CurrentUser {
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/auth/JwtAuthenticationFilter.java
+================================================================================
+package com.yourname.docvault.auth;
+
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.web.authentication.WebAuthenticationDetailsSource;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import java.io.IOException;
+import java.util.List;
+
+@Component
+public class JwtAuthenticationFilter extends OncePerRequestFilter {
+    private static final Logger log = LoggerFactory.getLogger(JwtAuthenticationFilter.class);
+    private final JwtService jwtService;
+
+    public JwtAuthenticationFilter(JwtService jwtService) {
+        this.jwtService = jwtService;
+    }
+
+    @Override
+    protected void doFilterInternal(
+            HttpServletRequest request,
+            HttpServletResponse response,
+            FilterChain filterChain
+    ) throws ServletException, IOException {
+        String header = request.getHeader("Authorization");
+        if (header != null && header.startsWith("Bearer ")) {
+            try {
+                UserPrincipal principal = jwtService.parseToken(header.substring(7));
+                var authentication = new UsernamePasswordAuthenticationToken(principal, null, List.of());
+                authentication.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
+                SecurityContextHolder.getContext().setAuthentication(authentication);
+            } catch (Exception ex) {
+                log.info("Rejected invalid JWT for {}", request.getRequestURI());
+            }
+        }
+        filterChain.doFilter(request, response);
+    }
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/auth/JwtService.java
+================================================================================
+package com.yourname.docvault.auth;
+
+import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.security.Keys;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+import javax.crypto.SecretKey;
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.util.Date;
+
+@Service
+public class JwtService {
+    private final SecretKey key;
+    private final long expirationMs;
+
+    public JwtService(
+            @Value("${app.jwt.secret}") String secret,
+            @Value("${app.jwt.expiration-ms}") long expirationMs
+    ) {
+        if (secret == null || secret.getBytes(StandardCharsets.UTF_8).length < 32) {
+            throw new IllegalArgumentException("JWT_SECRET must be at least 256 bits");
+        }
+        this.key = Keys.hmacShaKeyFor(secret.getBytes(StandardCharsets.UTF_8));
+        this.expirationMs = expirationMs;
+    }
+
+    public String generateToken(Long userId, String username) {
+        Instant now = Instant.now();
+        return Jwts.builder()
+                .subject(username)
+                .claim("userId", userId)
+                .claim("username", username)
+                .issuedAt(Date.from(now))
+                .expiration(Date.from(now.plusMillis(expirationMs)))
+                .signWith(key)
+                .compact();
+    }
+
+    public UserPrincipal parseToken(String token) {
+        Claims claims = Jwts.parser()
+                .verifyWith(key)
+                .build()
+                .parseSignedClaims(token)
+                .getPayload();
+
+        Long userId = claims.get("userId", Long.class);
+        String username = claims.get("username", String.class);
+        return new UserPrincipal(userId, username);
+    }
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/auth/SecurityConfig.java
+================================================================================
+package com.yourname.docvault.auth;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.yourname.docvault.common.ApiError;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatus;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.config.annotation.authentication.configuration.AuthenticationConfiguration;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.CorsConfigurationSource;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+
+import java.util.List;
+
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+    private final JwtAuthenticationFilter jwtAuthenticationFilter;
+
+    public SecurityConfig(JwtAuthenticationFilter jwtAuthenticationFilter) {
+        this.jwtAuthenticationFilter = jwtAuthenticationFilter;
+    }
+
+    @Bean
+    SecurityFilterChain securityFilterChain(
+            HttpSecurity http,
+            ObjectMapper objectMapper,
+            CorsConfigurationSource corsConfigurationSource
+    ) throws Exception {
+        http
+                .csrf(AbstractHttpConfigurer::disable)
+                .cors(cors -> cors.configurationSource(corsConfigurationSource))
+                .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                .authorizeHttpRequests(auth -> auth
+                        .requestMatchers(HttpMethod.POST, "/api/auth/register", "/api/auth/login").permitAll()
+                        .requestMatchers("/ws/**").permitAll()
+                        .anyRequest().authenticated()
+                )
+                .exceptionHandling(ex -> ex
+                        .authenticationEntryPoint((request, response, authException) -> {
+                            response.setStatus(HttpStatus.UNAUTHORIZED.value());
+                            response.setContentType("application/json");
+                            objectMapper.writeValue(response.getOutputStream(),
+                                    new ApiError("Unauthorized", HttpStatus.UNAUTHORIZED.value()));
+                        })
+                        .accessDeniedHandler((request, response, accessDeniedException) -> {
+                            response.setStatus(HttpStatus.FORBIDDEN.value());
+                            response.setContentType("application/json");
+                            objectMapper.writeValue(response.getOutputStream(),
+                                    new ApiError("Access denied", HttpStatus.FORBIDDEN.value()));
+                        })
+                )
+                .addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class);
+
+        return http.build();
+    }
+
+    @Bean
+    CorsConfigurationSource corsConfigurationSource(@Value("${app.cors.allowed-origins}") String allowedOrigins) {
+        CorsConfiguration configuration = new CorsConfiguration();
+        configuration.setAllowedOrigins(List.of(allowedOrigins.split(",")));
+        configuration.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE", "OPTIONS"));
+        configuration.setAllowedHeaders(List.of("Authorization", "Content-Type"));
+        configuration.setAllowCredentials(true);
+
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/**", configuration);
+        return source;
+    }
+
+    @Bean
+    PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+
+    @Bean
+    AuthenticationManager authenticationManager(AuthenticationConfiguration configuration) throws Exception {
+        return configuration.getAuthenticationManager();
+    }
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/auth/UserPrincipal.java
+================================================================================
+package com.yourname.docvault.auth;
+
+public record UserPrincipal(Long id, String username) {
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/user/AiAccessRequest.java
+================================================================================
+package com.yourname.docvault.user;
+
+import jakarta.validation.constraints.NotNull;
+
+public record AiAccessRequest(@NotNull Boolean aiAccess) {
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/user/User.java
+================================================================================
+package com.yourname.docvault.user;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.PrePersist;
+import jakarta.persistence.Table;
+
+import java.time.Instant;
+
+@Entity
+@Table(name = "users")
+public class User {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false, unique = true)
+    private String username;
+
+    @Column(nullable = false)
+    private String password;
+
+    @Column(name = "ai_access", nullable = false)
+    private boolean aiAccess;
+
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private Instant createdAt;
+
+    public Long getId() {
+        return id;
+    }
+
+    public void setId(Long id) {
+        this.id = id;
+    }
+
+    public String getUsername() {
+        return username;
+    }
+
+    public void setUsername(String username) {
+        this.username = username;
+    }
+
+    public String getPassword() {
+        return password;
+    }
+
+    public void setPassword(String password) {
+        this.password = password;
+    }
+
+    public boolean isAiAccess() {
+        return aiAccess;
+    }
+
+    public void setAiAccess(boolean aiAccess) {
+        this.aiAccess = aiAccess;
+    }
+
+    public Instant getCreatedAt() {
+        return createdAt;
+    }
+
+    @PrePersist
+    void onCreate() {
+        this.createdAt = Instant.now();
+    }
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/user/UserController.java
+================================================================================
+package com.yourname.docvault.user;
+
+import com.yourname.docvault.auth.CurrentUser;
+import com.yourname.docvault.auth.UserPrincipal;
+import jakarta.validation.Valid;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PutMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@RequestMapping("/api/users")
+public class UserController {
+    private final UserService userService;
+
+    public UserController(UserService userService) {
+        this.userService = userService;
+    }
+
+    @GetMapping("/me")
+    public UserResponse me(@CurrentUser UserPrincipal principal) {
+        return UserResponse.from(userService.requireUser(principal.id()));
+    }
+
+    @PutMapping("/ai-access")
+    public UserResponse updateAiAccess(
+            @CurrentUser UserPrincipal principal,
+            @Valid @RequestBody AiAccessRequest request
+    ) {
+        return UserResponse.from(userService.setAiAccess(principal.id(), request.aiAccess()));
+    }
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/user/UserRepository.java
+================================================================================
+package com.yourname.docvault.user;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+
+import java.util.Optional;
+
+public interface UserRepository extends JpaRepository<User, Long> {
+    Optional<User> findByUsername(String username);
+
+    boolean existsByUsername(String username);
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/user/UserResponse.java
+================================================================================
+package com.yourname.docvault.user;
+
+public record UserResponse(Long id, String username, boolean aiAccess) {
+    public static UserResponse from(User user) {
+        return new UserResponse(user.getId(), user.getUsername(), user.isAiAccess());
+    }
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/user/UserService.java
+================================================================================
+package com.yourname.docvault.user;
+
+import com.yourname.docvault.common.ApiException;
+import org.springframework.http.HttpStatus;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class UserService {
+    private final UserRepository userRepository;
+
+    public UserService(UserRepository userRepository) {
+        this.userRepository = userRepository;
+    }
+
+    @Transactional(readOnly = true)
+    public User requireUser(Long userId) {
+        return userRepository.findById(userId)
+                .orElseThrow(() -> new ApiException("User not found", HttpStatus.NOT_FOUND));
+    }
+
+    @Transactional
+    public User setAiAccess(Long userId, boolean aiAccess) {
+        User user = requireUser(userId);
+        user.setAiAccess(aiAccess);
+        return userRepository.save(user);
+    }
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/search/SearchController.java
+================================================================================
+package com.yourname.docvault.search;
+
+import com.yourname.docvault.auth.CurrentUser;
+import com.yourname.docvault.auth.UserPrincipal;
+import jakarta.validation.Valid;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@RequestMapping("/api/search")
+public class SearchController {
+    private final SearchService searchService;
+
+    public SearchController(SearchService searchService) {
+        this.searchService = searchService;
+    }
+
+    @PostMapping
+    public SearchResponse search(@CurrentUser UserPrincipal principal, @Valid @RequestBody SearchRequest request) {
+        return searchService.search(principal.id(), request.query());
+    }
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/search/SearchDocument.java
+================================================================================
+package com.yourname.docvault.search;
+
+public record SearchDocument(Long id, String name, String content, double similarityScore) {
+    public SearchResult toResult() {
+        return new SearchResult(id, name, similarityScore);
+    }
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/search/SearchRequest.java
+================================================================================
+package com.yourname.docvault.search;
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
+
+public record SearchRequest(@NotBlank @Size(max = 2000) String query) {
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/search/SearchResponse.java
+================================================================================
+package com.yourname.docvault.search;
+
+import java.util.List;
+
+public record SearchResponse(String mode, List<SearchResult> results, String message) {
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/search/SearchResult.java
+================================================================================
+package com.yourname.docvault.search;
+
+public record SearchResult(Long id, String name, double similarityScore) {
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/search/SearchService.java
+================================================================================
+package com.yourname.docvault.search;
+
+import com.yourname.docvault.external.GroqClient;
+import com.yourname.docvault.external.HuggingFaceClient;
+import com.yourname.docvault.user.User;
+import com.yourname.docvault.user.UserService;
+import com.yourname.docvault.websocket.SocketEvent;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.messaging.simp.SimpMessagingTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.List;
+
+@Service
+public class SearchService {
+    private static final Logger log = LoggerFactory.getLogger(SearchService.class);
+
+    private final HuggingFaceClient huggingFaceClient;
+    private final GroqClient groqClient;
+    private final VectorSearchRepository vectorSearchRepository;
+    private final UserService userService;
+    private final SimpMessagingTemplate messagingTemplate;
+    private final int topK;
+
+    public SearchService(
+            HuggingFaceClient huggingFaceClient,
+            GroqClient groqClient,
+            VectorSearchRepository vectorSearchRepository,
+            UserService userService,
+            SimpMessagingTemplate messagingTemplate,
+            @Value("${app.search.top-k}") int topK
+    ) {
+        this.huggingFaceClient = huggingFaceClient;
+        this.groqClient = groqClient;
+        this.vectorSearchRepository = vectorSearchRepository;
+        this.userService = userService;
+        this.messagingTemplate = messagingTemplate;
+        this.topK = topK;
+    }
+
+    @Transactional(readOnly = true)
+    public SearchResponse search(Long userId, String query) {
+        User user = userService.requireUser(userId);
+        send(userId, "status", "Embedding query");
+        List<Double> queryEmbedding = huggingFaceClient.embed(query);
+
+        boolean aiMode = user.isAiAccess();
+        send(userId, "status", "Searching your files");
+        List<SearchDocument> documents = vectorSearchRepository.search(userId, queryEmbedding, topK, aiMode);
+        List<SearchResult> results = documents.stream().map(SearchDocument::toResult).toList();
+
+        if (!aiMode) {
+            send(userId, "results", results);
+            log.info("Returned {} search results for user {}", results.size(), userId);
+            return new SearchResponse("semantic", results, "Search complete");
+        }
+
+        send(userId, "ai-start", results);
+        groqClient.streamSummary(query, documents, token -> send(userId, "ai-token", token));
+        send(userId, "done", "AI summary complete");
+        log.info("Streamed AI search summary for user {}", userId);
+        return new SearchResponse("ai", results, "AI summary streamed over websocket");
+    }
+
+    private void send(Long userId, String type, Object payload) {
+        messagingTemplate.convertAndSend(
+                "/topic/search-results/" + userId,
+                SocketEvent.of(type, payload)
+        );
+    }
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/search/VectorSearchRepository.java
+================================================================================
+package com.yourname.docvault.search;
+
+import com.yourname.docvault.file.FileVectorRepository;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
+@Repository
+public class VectorSearchRepository {
+    private final JdbcTemplate jdbcTemplate;
+
+    public VectorSearchRepository(JdbcTemplate jdbcTemplate) {
+        this.jdbcTemplate = jdbcTemplate;
+    }
+
+    public List<SearchDocument> search(Long userId, List<Double> queryEmbedding, int limit, boolean includeContent) {
+        String contentColumn = includeContent ? "f.content" : "''";
+        String sql = """
+                SELECT f.id,
+                       f.name,
+                       %s AS content,
+                       1 - (fv.embedding <=> CAST(? AS vector)) AS similarity_score
+                FROM file_vectors fv
+                JOIN files f ON f.id = fv.file_id
+                WHERE f.user_id = ?
+                ORDER BY fv.embedding <=> CAST(? AS vector)
+                LIMIT ?
+                """.formatted(contentColumn);
+
+        String vectorLiteral = FileVectorRepository.toVectorLiteral(queryEmbedding);
+        return jdbcTemplate.query(sql, (rs, rowNum) -> new SearchDocument(
+                rs.getLong("id"),
+                rs.getString("name"),
+                rs.getString("content"),
+                rs.getDouble("similarity_score")
+        ), vectorLiteral, userId, vectorLiteral, limit);
+    }
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/common/ApiError.java
+================================================================================
+package com.yourname.docvault.common;
+
+public record ApiError(String error, int status) {
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/common/ApiException.java
+================================================================================
+package com.yourname.docvault.common;
+
+import org.springframework.http.HttpStatus;
+
+public class ApiException extends RuntimeException {
+    private final HttpStatus status;
+
+    public ApiException(String message, HttpStatus status) {
+        super(message);
+        this.status = status;
+    }
+
+    public HttpStatus getStatus() {
+        return status;
+    }
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/common/GlobalExceptionHandler.java
+================================================================================
+package com.yourname.docvault.common;
+
+import jakarta.validation.ConstraintViolationException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.multipart.MaxUploadSizeExceededException;
+
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+    private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
+
+    @ExceptionHandler(ApiException.class)
+    ResponseEntity<ApiError> handleApiException(ApiException ex) {
+        return error(ex.getMessage(), ex.getStatus());
+    }
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    ResponseEntity<ApiError> handleValidation(MethodArgumentNotValidException ex) {
+        String message = ex.getBindingResult().getFieldErrors().stream()
+                .findFirst()
+                .map(error -> error.getField() + " " + error.getDefaultMessage())
+                .orElse("Invalid request");
+        return error(message, HttpStatus.BAD_REQUEST);
+    }
+
+    @ExceptionHandler(ConstraintViolationException.class)
+    ResponseEntity<ApiError> handleConstraintViolation(ConstraintViolationException ex) {
+        return error(ex.getMessage(), HttpStatus.BAD_REQUEST);
+    }
+
+    @ExceptionHandler(MaxUploadSizeExceededException.class)
+    ResponseEntity<ApiError> handleMaxUpload(MaxUploadSizeExceededException ex) {
+        return error("File exceeds the 1MB upload limit", HttpStatus.PAYLOAD_TOO_LARGE);
+    }
+
+    @ExceptionHandler(AccessDeniedException.class)
+    ResponseEntity<ApiError> handleAccessDenied(AccessDeniedException ex) {
+        return error("Access denied", HttpStatus.FORBIDDEN);
+    }
+
+    @ExceptionHandler(Exception.class)
+    ResponseEntity<ApiError> handleUnexpected(Exception ex) {
+        log.error("Unhandled application error", ex);
+        return error("Unexpected server error", HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+
+    private ResponseEntity<ApiError> error(String message, HttpStatus status) {
+        return ResponseEntity.status(status).body(new ApiError(message, status.value()));
+    }
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/external/GroqClient.java
+================================================================================
+package com.yourname.docvault.external;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.yourname.docvault.common.ApiException;
+import com.yourname.docvault.search.SearchDocument;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.stereotype.Component;
+import org.springframework.web.reactive.function.client.WebClient;
+
+import java.time.Duration;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
+
+@Component
+public class GroqClient {
+    private static final Logger log = LoggerFactory.getLogger(GroqClient.class);
+
+    private final WebClient webClient;
+    private final ObjectMapper objectMapper;
+    private final String model;
+
+    public GroqClient(
+            @Value("${app.external.groq-api-key}") String apiKey,
+            @Value("${app.external.groq-model}") String model,
+            ObjectMapper objectMapper
+    ) {
+        this.webClient = WebClient.builder()
+                .baseUrl("https://api.groq.com/openai/v1")
+                .defaultHeader("Authorization", "Bearer " + apiKey)
+                .build();
+        this.objectMapper = objectMapper;
+        this.model = model;
+    }
+
+    public void streamSummary(String query, List<SearchDocument> documents, Consumer<String> tokenConsumer) {
+        String systemPrompt = "You are a document assistant. The user asked: `" + query
+                + "`. The following documents were retrieved as relevant. "
+                + "Summarize what they say in relation to the user's query.";
+
+        StringBuilder userPrompt = new StringBuilder();
+        for (SearchDocument document : documents) {
+            userPrompt.append("Document: ").append(document.name()).append("\n")
+                    .append(document.content()).append("\n\n");
+        }
+
+        Map<String, Object> body = Map.of(
+                "model", model,
+                "stream", true,
+                "messages", List.of(
+                        Map.of("role", "system", "content", systemPrompt),
+                        Map.of("role", "user", "content", userPrompt.toString())
+                )
+        );
+
+        try {
+            StringBuilder buffer = new StringBuilder();
+            AtomicBoolean emittedToken = new AtomicBoolean(false);
+            webClient.post()
+                    .uri("/chat/completions")
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .accept(MediaType.TEXT_EVENT_STREAM)
+                    .bodyValue(body)
+                    .retrieve()
+                    .bodyToFlux(String.class)
+                    .timeout(Duration.ofSeconds(90))
+                    .doOnNext(chunk -> handleChunk(chunk, buffer, tokenConsumer, emittedToken))
+                    .blockLast();
+            flushBuffer(buffer, tokenConsumer, emittedToken);
+
+            if (!emittedToken.get()) {
+                log.warn("Groq stream returned no tokens; falling back to non-stream completion.");
+                sendFallbackSummary(body, tokenConsumer);
+            }
+        } catch (Exception ex) {
+            log.error("Groq streaming request failed", ex);
+            throw new ApiException("AI summary service unavailable", HttpStatus.BAD_GATEWAY);
+        }
+    }
+
+    private void handleChunk(String chunk, StringBuilder buffer, Consumer<String> tokenConsumer, AtomicBoolean emittedToken) {
+        buffer.append(chunk);
+        int newlineIndex;
+        while ((newlineIndex = indexOfLineBreak(buffer)) >= 0) {
+            String line = buffer.substring(0, newlineIndex).trim();
+            buffer.delete(0, newlineIndex + 1);
+            processStreamLine(line, tokenConsumer, emittedToken);
+        }
+    }
+
+    private int indexOfLineBreak(StringBuilder buffer) {
+        for (int i = 0; i < buffer.length(); i++) {
+            char c = buffer.charAt(i);
+            if (c == '\n' || c == '\r') {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private void flushBuffer(StringBuilder buffer, Consumer<String> tokenConsumer, AtomicBoolean emittedToken) {
+        String remaining = buffer.toString().trim();
+        if (!remaining.isEmpty()) {
+            processStreamLine(remaining, tokenConsumer, emittedToken);
+        }
+    }
+
+    private void processStreamLine(String trimmed, Consumer<String> tokenConsumer, AtomicBoolean emittedToken) {
+        if (!trimmed.startsWith("data:")) {
+            return;
+        }
+        String data = trimmed.substring(5).trim();
+        if ("[DONE]".equals(data)) {
+            return;
+        }
+        try {
+            JsonNode root = objectMapper.readTree(data);
+            JsonNode content = root.path("choices").path(0).path("delta").path("content");
+            if (!content.isMissingNode() && !content.asText().isEmpty()) {
+                tokenConsumer.accept(content.asText());
+                emittedToken.set(true);
+            }
+        } catch (Exception ex) {
+            log.debug("Skipping unparsable Groq stream chunk");
+        }
+    }
+
+    private void sendFallbackSummary(Map<String, Object> body, Consumer<String> tokenConsumer) {
+        try {
+            Map<String, Object> fallbackBody = Map.of(
+                    "model", body.get("model"),
+                    "messages", body.get("messages")
+            );
+            JsonNode response = webClient.post()
+                    .uri("/chat/completions")
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .bodyValue(fallbackBody)
+                    .retrieve()
+                    .bodyToMono(JsonNode.class)
+                    .block(Duration.ofSeconds(90));
+            if (response != null) {
+                String content = response.path("choices").path(0).path("message").path("content").asText();
+                if (content.isEmpty()) {
+                    content = response.path("choices").path(0).path("text").asText();
+                }
+                if (!content.isEmpty()) {
+                    tokenConsumer.accept(content);
+                }
+            }
+        } catch (Exception ex) {
+            log.error("Groq fallback request failed", ex);
+        }
+    }
+}
+
+********************************************************************************
+FILE: backend/src/main/java/com/yourname/docvault/external/HuggingFaceClient.java
+================================================================================
+package com.yourname.docvault.external;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.yourname.docvault.common.ApiException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.stereotype.Component;
+import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
+import reactor.util.retry.Retry;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+@Component
+public class HuggingFaceClient {
+    private static final Logger log = LoggerFactory.getLogger(HuggingFaceClient.class);
+    private static final String MODEL_URL =
+            "https://router.huggingface.co/hf-inference/models/sentence-transformers/all-MiniLM-L6-v2/pipeline/feature-extraction";
+
+    private final WebClient webClient;
+
+    public HuggingFaceClient(@Value("${app.external.huggingface-token}") String token) {
+        this.webClient = WebClient.builder()
+                .baseUrl(MODEL_URL)
+                .defaultHeader("Authorization", "Bearer " + token)
+                .build();
+    }
+
+    public List<Double> embed(String text) {
+        try {
+            JsonNode response = webClient.post()
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .bodyValue(Map.of("inputs", text))
+                    .retrieve()
+                    .bodyToMono(JsonNode.class)
+                    .retryWhen(Retry.backoff(2, Duration.ofMillis(750)).filter(this::isRetryable))
+                    .block(Duration.ofSeconds(45));
+
+            List<Double> embedding = parseEmbedding(response);
+            if (embedding.size() != 384) {
+                throw new ApiException("Embedding provider returned " + embedding.size() + " dimensions", HttpStatus.BAD_GATEWAY);
+            }
+            return embedding;
+        } catch (ApiException ex) {
+            throw ex;
+        } catch (Exception ex) {
+            log.error("HuggingFace embedding request failed", ex);
+            throw new ApiException("Embedding service unavailable", HttpStatus.BAD_GATEWAY);
+        }
+    }
+
+    private boolean isRetryable(Throwable throwable) {
+        return throwable instanceof WebClientResponseException.TooManyRequests
+                || throwable instanceof WebClientResponseException.ServiceUnavailable;
+    }
+
+    private List<Double> parseEmbedding(JsonNode node) {
+        if (node == null || !node.isArray() || node.isEmpty()) {
+            throw new ApiException("Invalid embedding response", HttpStatus.BAD_GATEWAY);
+        }
+        if (node.get(0).isNumber()) {
+            List<Double> values = new ArrayList<>();
+            node.forEach(value -> values.add(value.asDouble()));
+            return values;
+        }
+
+        if (node.get(0).isArray()) {
+            int dimensions = node.get(0).size();
+            double[] sums = new double[dimensions];
+            int rows = 0;
+            for (JsonNode row : node) {
+                if (!row.isArray() || row.size() != dimensions) {
+                    throw new ApiException("Invalid embedding response shape", HttpStatus.BAD_GATEWAY);
+                }
+                for (int i = 0; i < dimensions; i++) {
+                    sums[i] += row.get(i).asDouble();
+                }
+                rows++;
+            }
+            List<Double> averaged = new ArrayList<>(dimensions);
+            for (double sum : sums) {
+                averaged.add(sum / rows);
+            }
+            return averaged;
+        }
+
+        throw new ApiException("Invalid embedding response", HttpStatus.BAD_GATEWAY);
+    }
+}
+
+********************************************************************************
+FILE: frontend/src/App.jsx
+================================================================================
+import { Navigate, Route, Routes } from 'react-router-dom';
+import { AuthProvider, useAuth } from './hooks/useAuth.jsx';
+import Login from './pages/Login.jsx';
+import Register from './pages/Register.jsx';
+import Dashboard from './pages/Dashboard.jsx';
+
+function ProtectedRoute({ children }) {
+  const { isAuthenticated } = useAuth();
+  return isAuthenticated ? children : <Navigate to="/login" replace />;
+}
+
+function AppRoutes() {
+  return (
+    <Routes>
+      <Route path="/login" element={<Login />} />
+      <Route path="/register" element={<Register />} />
+      <Route path="/dashboard" element={<ProtectedRoute><Dashboard /></ProtectedRoute>} />
+      <Route path="*" element={<Navigate to="/dashboard" replace />} />
+    </Routes>
+  );
+}
+
+export default function App() {
+  return (
+    <AuthProvider>
+      <AppRoutes />
+    </AuthProvider>
+  );
+}
+
+********************************************************************************
+FILE: frontend/src/main.jsx
+================================================================================
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import { BrowserRouter } from 'react-router-dom';
+import App from './App.jsx';
+import './styles/app.css';
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <React.StrictMode>
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
+  </React.StrictMode>
+);
+
+********************************************************************************
+FILE: frontend/src/websocket/stompClient.js
+================================================================================
+import { Client } from '@stomp/stompjs';
+import SockJS from 'sockjs-client';
+import { API_BASE_URL } from '../api/client';
+
+export function createStompClient(token, onConnect) {
+  const client = new Client({
+    webSocketFactory: () => new SockJS(`${API_BASE_URL}/ws`),
+    connectHeaders: {
+      Authorization: `Bearer ${token}`
+    },
+    reconnectDelay: 3000,
+    onConnect
+  });
+
+  client.activate();
+  return client;
+}
+
+********************************************************************************
+FILE: frontend/src/styles/app.css
+================================================================================
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Newsreader:opsz,wght@6..72,600;6..72,700&display=swap');
+
+:root {
+  color-scheme: light;
+  --ink: #17201b;
+  --muted: #66736d;
+  --paper: #fbfaf5;
+  --panel: #ffffff;
+  --line: #dce4df;
+  --teal: #0f766e;
+  --coral: #e85d4f;
+  --gold: #d7a83a;
+  --green-soft: #e8f5ef;
+  --shadow: 0 18px 50px rgba(23, 32, 27, 0.12);
+  font-family: Inter, system-ui, sans-serif;
+  background: var(--paper);
+  color: var(--ink);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+.auth-shell {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background:
+    linear-gradient(135deg, rgba(15, 118, 110, 0.14), transparent 34%),
+    linear-gradient(315deg, rgba(232, 93, 79, 0.16), transparent 38%),
+    var(--paper);
+}
+
+.auth-panel {
+  width: min(440px, 100%);
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  padding: 36px;
+}
+
+.brand-mark {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--teal);
+  font-weight: 800;
+}
+
+.brand-mark.compact {
+  font-size: 20px;
+}
+
+h1,
+h2 {
+  font-family: Newsreader, Georgia, serif;
+  letter-spacing: 0;
+  margin: 0;
+}
+
+h1 {
+  margin-top: 24px;
+  font-size: clamp(36px, 8vw, 54px);
+}
+
+h2 {
+  font-size: 27px;
+}
+
+.auth-form {
+  display: grid;
+  gap: 18px;
+  margin-top: 28px;
+}
+
+label span {
+  display: block;
+  margin-bottom: 8px;
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.input-row,
+.search-form input {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 48px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  padding: 0 14px;
+  transition: border-color 160ms ease, box-shadow 160ms ease;
+}
+
+.input-row:focus-within,
+.search-form input:focus {
+  border-color: var(--teal);
+  box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.1);
+}
+
+.input-row input,
+.search-form input {
+  width: 100%;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--ink);
+}
+
+.primary-button,
+.ghost-button,
+.icon-button,
+.drop-zone {
+  border: 0;
+  border-radius: 8px;
+}
+
+.primary-button {
+  min-height: 48px;
+  display: inline-flex;
+  justify-content: center;
+  align-items: center;
+  gap: 9px;
+  background: var(--teal);
+  color: white;
+  font-weight: 800;
+  padding: 0 18px;
+  transition: transform 160ms ease, background 160ms ease;
+}
+
+.primary-button:hover,
+.ghost-button:hover,
+.icon-button:hover,
+.drop-zone:hover {
+  transform: translateY(-1px);
+}
+
+.primary-button:disabled {
+  opacity: 0.65;
+  transform: none;
+}
+
+.auth-link {
+  margin: 22px 0 0;
+  color: var(--muted);
+}
+
+a {
+  color: var(--teal);
+  font-weight: 800;
+}
+
+.error {
+  color: #a7352b;
+  margin: 0;
+  font-weight: 700;
+}
+
+.app-shell {
+  min-height: 100vh;
+  padding: 28px;
+  background:
+    linear-gradient(180deg, rgba(15, 118, 110, 0.08), transparent 270px),
+    var(--paper);
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  max-width: 1240px;
+  margin: 0 auto 24px;
+}
+
+.topbar p {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.ghost-button {
+  min-height: 42px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 15px;
+  background: #fff;
+  color: var(--ink);
+  border: 1px solid var(--line);
+  font-weight: 800;
+}
+
+.dashboard-grid {
+  max-width: 1240px;
+  margin: 0 auto;
+  display: grid;
+  grid-template-columns: 0.9fr 1.1fr;
+  gap: 18px;
+  align-items: start;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 10px 32px rgba(23, 32, 27, 0.07);
+  padding: 22px;
+}
+
+.search-panel {
+  grid-column: 1 / -1;
+}
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+
+.panel-kicker,
+.mode-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.drop-zone {
+  width: 100%;
+  min-height: 180px;
+  display: grid;
+  place-items: center;
+  gap: 10px;
+  background: var(--green-soft);
+  border: 1px dashed rgba(15, 118, 110, 0.55);
+  color: var(--teal);
+  font-weight: 900;
+  transition: transform 160ms ease, background 160ms ease;
+}
+
+.drop-zone.is-dragging {
+  background: #d9f0e7;
+}
+
+.drop-icon {
+  width: 50px;
+  height: 50px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.hidden-input {
+  display: none;
+}
+
+.status-strip {
+  min-height: 40px;
+  display: flex;
+  align-items: center;
+  margin-top: 14px;
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  margin: 0;
+}
+
+.toggle input {
+  inline-size: 18px;
+  block-size: 18px;
+  accent-color: var(--coral);
+}
+
+.toggle span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0 0 0 8px;
+  color: var(--ink);
+  font-size: 14px;
+}
+
+.file-list {
+  display: grid;
+  gap: 10px;
+}
+
+.file-row,
+.ranked-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 13px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.file-row strong,
+.ranked-row strong {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.file-row time {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.icon-button {
+  width: 38px;
+  height: 38px;
+  display: grid;
+  place-items: center;
+  color: var(--ink);
+  background: #f6f4ed;
+}
+
+.icon-button.danger:hover {
+  background: #fee8e5;
+  color: var(--coral);
+}
+
+.empty-state {
+  min-height: 120px;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+}
+
+.search-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+}
+
+.search-form input {
+  min-height: 52px;
+}
+
+.search-output {
+  min-height: 220px;
+  margin-top: 18px;
+  padding: 18px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: #fff;
+}
+
+.search-output.idle {
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.status-text {
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.ranked-list {
+  display: grid;
+  gap: 10px;
+}
+
+.ranked-row {
+  grid-template-columns: 38px minmax(0, 1fr) auto;
+}
+
+.ranked-row span {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  background: var(--green-soft);
+  color: var(--teal);
+  font-weight: 900;
+}
+
+.ranked-row em {
+  color: var(--coral);
+  font-style: normal;
+  font-weight: 900;
+}
+
+.mini-results {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.mini-results span {
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: #fff5df;
+  color: #6b4c08;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.summary-text {
+  white-space: pre-wrap;
+  line-height: 1.65;
+  font-size: 16px;
+}
+
+.spin {
+  animation: spin 800ms linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (max-width: 800px) {
+  .app-shell {
+    padding: 18px;
+  }
+
+  .topbar,
+  .dashboard-grid,
+  .search-form {
+    grid-template-columns: 1fr;
+  }
+
+  .topbar {
+    align-items: flex-start;
+  }
+
+  .search-panel {
+    grid-column: auto;
+  }
+
+  .panel-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
+
+********************************************************************************
+FILE: frontend/src/components/FilesPanel.jsx
+================================================================================
+import { Brain, Trash2 } from 'lucide-react';
+import api from '../api/client';
+
+export default function FilesPanel({ files, aiAccess, onToggleAi, onDeleted }) {
+  async function remove(fileId) {
+    await api.delete(`/files/${fileId}`);
+    onDeleted();
+  }
+
+  return (
+    <section className="panel files-panel">
+      <div className="panel-header">
+        <h2>My Files</h2>
+        <label className="toggle">
+          <input type="checkbox" checked={aiAccess} onChange={(event) => onToggleAi(event.target.checked)} />
+          <span><Brain size={16} /> AI access</span>
+        </label>
+      </div>
+      <div className="file-list">
+        {files.length === 0 && <div className="empty-state">No files yet</div>}
+        {files.map((file) => (
+          <article className="file-row" key={file.id}>
+            <div>
+              <strong>{file.name}</strong>
+              <time>{new Date(file.uploadedAt).toLocaleString()}</time>
+            </div>
+            <button className="icon-button danger" title="Delete file" onClick={() => remove(file.id)}>
+              <Trash2 size={17} />
+            </button>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+********************************************************************************
+FILE: frontend/src/components/SearchPanel.jsx
+================================================================================
+import { useState } from 'react';
+import { BrainCircuit, Search, Sparkles } from 'lucide-react';
+import api from '../api/client';
+
+export default function SearchPanel({ aiAccess, events, socketReady }) {
+  const [query, setQuery] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  async function submit(event) {
+    event.preventDefault();
+    if (!query.trim()) return;
+    if (aiAccess && !socketReady) {
+      setError('Connecting to AI websocket... please wait a moment.');
+      return;
+    }
+    setError('');
+    setLoading(true);
+    try {
+      await api.post('/search', { query });
+    } catch (err) {
+      setError(err.response?.data?.error || 'Search failed');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <section className={`panel search-panel ${aiAccess ? 'ai-mode' : 'semantic-mode'}`}>
+      <div className="panel-header">
+        <h2>{aiAccess ? 'AI Summary' : 'Semantic Search'}</h2>
+        <span className="mode-pill">{aiAccess ? <Sparkles size={15} /> : <Search size={15} />}{aiAccess ? 'AI' : 'Ranked'}</span>
+      </div>
+      <form onSubmit={submit} className="search-form">
+        <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Ask across your files" />
+        <button className="primary-button" disabled={loading || (aiAccess && !socketReady)}>
+          {aiAccess ? <BrainCircuit size={18} /> : <Search size={18} />}
+          {loading ? 'Searching...' : 'Search'}
+        </button>
+      </form>
+      {error && <p className="error">{error}</p>}
+      {aiAccess && !socketReady && !loading && <p className="info">Connecting to the AI websocket...</p>}
+      <SearchOutput aiAccess={aiAccess} events={events} loading={loading} />
+    </section>
+  );
+}
+
+function SearchOutput({ aiAccess, events, loading }) {
+  const status = [...events].reverse().find((event) => event.type === 'status')?.payload;
+  const done = [...events].reverse().find((event) => event.type === 'done')?.payload;
+  const resultsEvent = [...events].reverse().find((event) => event.type === 'results' || event.type === 'ai-start');
+  const tokens = events.filter((event) => event.type === 'ai-token').map((event) => event.payload).join('');
+  const showPlaceholder = aiAccess && !tokens && done;
+
+  if (events.length === 0) {
+    if (loading) {
+      return <div className="search-output idle">{aiAccess ? 'Waiting for AI summary...' : 'Waiting for results...'}</div>;
+    }
+    return <div className="search-output idle">{aiAccess ? 'AI mode is on' : 'Semantic mode is on'}</div>;
+  }
+
+  if (aiAccess) {
+    return (
+      <div className="search-output">
+        {status && <p className="status-text">{status}</p>}
+        {done && <p className="status-text success">{done}</p>}
+        {resultsEvent?.payload?.length > 0 && (
+          <div className="mini-results">
+            {resultsEvent.payload.map((result) => <span key={result.id}>{result.name}</span>)}
+          </div>
+        )}
+        <div className="summary-text">
+          {tokens || (showPlaceholder ? 'AI summary completed, but no tokens were received.' : 'Waiting for tokens...')}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="search-output">
+      {status && <p className="status-text">{status}</p>}
+      <div className="ranked-list">
+        {(resultsEvent?.payload || []).map((result, index) => (
+          <article key={result.id} className="ranked-row">
+            <span>{index + 1}</span>
+            <strong>{result.name}</strong>
+            <em>{Math.max(result.similarityScore, 0).toFixed(3)}</em>
+          </article>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+********************************************************************************
+FILE: frontend/src/components/UploadPanel.jsx
+================================================================================
+import { useRef, useState } from 'react';
+import { FileUp, Loader2 } from 'lucide-react';
+import api from '../api/client';
+
+export default function UploadPanel({ progress, onUploaded }) {
+  const inputRef = useRef(null);
+  const [dragging, setDragging] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState('');
+
+  async function upload(file) {
+    if (!file) return;
+    setError('');
+    if (!file.name.toLowerCase().endsWith('.txt')) {
+      setError('Only .txt files are supported');
+      return;
+    }
+
+    const formData = new FormData();
+    formData.append('file', file);
+    setUploading(true);
+    try {
+      await api.post('/files/upload', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' }
+      });
+      onUploaded();
+    } catch (err) {
+      setError(err.response?.data?.error || 'Upload failed');
+    } finally {
+      setUploading(false);
+      if (inputRef.current) inputRef.current.value = '';
+    }
+  }
+
+  return (
+    <section className="panel upload-panel">
+      <div className="panel-header">
+        <h2>Upload</h2>
+        <span className="panel-kicker">TXT · 1MB</span>
+      </div>
+      <button
+        type="button"
+        className={`drop-zone ${dragging ? 'is-dragging' : ''}`}
+        onClick={() => inputRef.current?.click()}
+        onDragOver={(event) => {
+          event.preventDefault();
+          setDragging(true);
+        }}
+        onDragLeave={() => setDragging(false)}
+        onDrop={(event) => {
+          event.preventDefault();
+          setDragging(false);
+          upload(event.dataTransfer.files[0]);
+        }}
+      >
+        <span className="drop-icon">{uploading ? <Loader2 className="spin" /> : <FileUp />}</span>
+        <span>{uploading ? 'Working...' : 'Drop a text file'}</span>
+      </button>
+      <input ref={inputRef} className="hidden-input" type="file" accept=".txt,text/plain" onChange={(event) => upload(event.target.files[0])} />
+      <div className="status-strip">{progress || 'Ready'}</div>
+      {error && <p className="error">{error}</p>}
+    </section>
+  );
+}
+
+********************************************************************************
+FILE: frontend/src/hooks/useAuth.jsx
+================================================================================
+import { createContext, useContext, useEffect, useMemo, useState } from 'react';
+import api from '../api/client';
+
+const AuthContext = createContext(null);
+
+export function AuthProvider({ children }) {
+  const [token, setToken] = useState(() => localStorage.getItem('docvault.token'));
+  const [user, setUser] = useState(() => {
+    const raw = localStorage.getItem('docvault.user');
+    return raw ? JSON.parse(raw) : null;
+  });
+
+  useEffect(() => {
+    if (!token) return;
+    api.get('/users/me')
+      .then((response) => saveSession(token, response.data))
+      .catch(() => clearSession());
+  }, []);
+
+  function saveSession(nextToken, nextUser) {
+    localStorage.setItem('docvault.token', nextToken);
+    localStorage.setItem('docvault.user', JSON.stringify(nextUser));
+    setToken(nextToken);
+    setUser(nextUser);
+  }
+
+  function clearSession() {
+    localStorage.removeItem('docvault.token');
+    localStorage.removeItem('docvault.user');
+    setToken(null);
+    setUser(null);
+  }
+
+  async function login(username, password) {
+    const response = await api.post('/auth/login', { username, password });
+    saveSession(response.data.token, {
+      id: response.data.userId,
+      username: response.data.username,
+      aiAccess: response.data.aiAccess
+    });
+  }
+
+  async function register(username, password) {
+    const response = await api.post('/auth/register', { username, password });
+    saveSession(response.data.token, {
+      id: response.data.userId,
+      username: response.data.username,
+      aiAccess: response.data.aiAccess
+    });
+  }
+
+  function updateUser(nextUser) {
+    setUser(nextUser);
+    localStorage.setItem('docvault.user', JSON.stringify(nextUser));
+  }
+
+  const value = useMemo(() => ({
+    token,
+    user,
+    isAuthenticated: Boolean(token && user),
+    login,
+    register,
+    logout: clearSession,
+    updateUser
+  }), [token, user]);
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+}
+
+export function useAuth() {
+  return useContext(AuthContext);
+}
+
+********************************************************************************
+FILE: frontend/src/api/client.js
+================================================================================
+import axios from 'axios';
+
+export const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8080';
+
+const api = axios.create({
+  baseURL: `${API_BASE_URL}/api`
+});
+
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem('docvault.token');
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401) {
+      localStorage.removeItem('docvault.token');
+      localStorage.removeItem('docvault.user');
+    }
+    return Promise.reject(error);
+  }
+);
+
+export default api;
+
+********************************************************************************
+FILE: frontend/src/pages/Dashboard.jsx
+================================================================================
+import { useEffect, useMemo, useState } from 'react';
+import { LogOut, ShieldCheck, Vault } from 'lucide-react';
+import api from '../api/client';
+import { useAuth } from '../hooks/useAuth.jsx';
+import { createStompClient } from '../websocket/stompClient';
+import UploadPanel from '../components/UploadPanel.jsx';
+import FilesPanel from '../components/FilesPanel.jsx';
+import SearchPanel from '../components/SearchPanel.jsx';
+
+export default function Dashboard() {
+  const { token, user, logout, updateUser } = useAuth();
+  const [files, setFiles] = useState([]);
+  const [uploadProgress, setUploadProgress] = useState('');
+  const [searchEvents, setSearchEvents] = useState([]);
+  const [socketReady, setSocketReady] = useState(false);
+
+  const aiAccess = Boolean(user?.aiAccess);
+
+  const connectedUserId = user?.id;
+  useEffect(() => {
+    if (!token || !connectedUserId) return undefined;
+
+    const client = createStompClient(token, () => {
+      setSocketReady(true);
+      client.subscribe(`/topic/upload-progress/${connectedUserId}`, (message) => {
+        const event = JSON.parse(message.body);
+        setUploadProgress(event.payload);
+      });
+      client.subscribe(`/topic/search-results/${connectedUserId}`, (message) => {
+        const event = JSON.parse(message.body);
+        if (event.type === 'status' && event.payload === 'Embedding query') {
+          setSearchEvents([event]);
+          return;
+        }
+        if (event.type === 'status' || event.type === 'results' || event.type === 'ai-start') {
+          setSearchEvents((current) => [...current.filter((item) => item.type === 'ai-token'), event]);
+        } else if (event.type === 'done') {
+          setSearchEvents((current) => [...current, event]);
+        } else {
+          setSearchEvents((current) => [...current, event]);
+        }
+      });
+    });
+
+    client.onStompError = (frame) => {
+      console.error('WebSocket STOMP error', frame);
+      setSocketReady(false);
+    };
+
+    client.onWebSocketError = (error) => {
+      console.error('WebSocket connection error', error);
+      setSocketReady(false);
+    };
+
+    return () => {
+      setSocketReady(false);
+      client.deactivate();
+    };
+  }, [token, connectedUserId]);
+
+  useEffect(() => {
+    refreshFiles();
+  }, []);
+
+  async function refreshFiles() {
+    const response = await api.get('/files');
+    setFiles(response.data);
+  }
+
+  async function toggleAi(nextValue) {
+    const response = await api.put('/users/ai-access', { aiAccess: nextValue });
+    updateUser(response.data);
+    setSearchEvents([]);
+  }
+
+  const fileCountLabel = useMemo(() => `${files.length} ${files.length === 1 ? 'file' : 'files'}`, [files.length]);
+
+  return (
+    <main className="app-shell">
+      <header className="topbar">
+        <div>
+          <div className="brand-mark compact"><Vault size={25} /> DocVault</div>
+          <p><ShieldCheck size={15} /> {user?.username} · {fileCountLabel}</p>
+        </div>
+        <button className="ghost-button" onClick={logout}><LogOut size={17} /> Sign out</button>
+      </header>
+
+      <section className="dashboard-grid">
+        <UploadPanel progress={uploadProgress} onUploaded={refreshFiles} />
+        <FilesPanel files={files} aiAccess={aiAccess} onToggleAi={toggleAi} onDeleted={refreshFiles} />
+        <SearchPanel aiAccess={aiAccess} events={searchEvents} socketReady={socketReady} />
+      </section>
+    </main>
+  );
+}
+
+********************************************************************************
+FILE: frontend/src/pages/Login.jsx
+================================================================================
+import { useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import { LockKeyhole, Mail, Vault } from 'lucide-react';
+import { useAuth } from '../hooks/useAuth.jsx';
+
+export default function Login() {
+  const { login } = useAuth();
+  const navigate = useNavigate();
+  const [form, setForm] = useState({ username: '', password: '' });
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  async function submit(event) {
+    event.preventDefault();
+    setError('');
+    setLoading(true);
+    try {
+      await login(form.username, form.password);
+      navigate('/dashboard');
+    } catch (err) {
+      setError(err.response?.data?.error || 'Login failed');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <main className="auth-shell">
+      <section className="auth-panel">
+        <div className="brand-mark"><Vault size={28} /> DocVault</div>
+        <h1>Welcome back</h1>
+        <form onSubmit={submit} className="auth-form">
+          <label>
+            <span>Email</span>
+            <div className="input-row">
+              <Mail size={18} />
+              <input type="email" value={form.username} onChange={(e) => setForm({ ...form, username: e.target.value })} required />
+            </div>
+          </label>
+          <label>
+            <span>Password</span>
+            <div className="input-row">
+              <LockKeyhole size={18} />
+              <input type="password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} required />
+            </div>
+          </label>
+          {error && <p className="error">{error}</p>}
+          <button className="primary-button" disabled={loading}>{loading ? 'Signing in...' : 'Sign in'}</button>
+        </form>
+        <p className="auth-link">New here? <Link to="/register">Create an account</Link></p>
+      </section>
+    </main>
+  );
+}
+
+********************************************************************************
+FILE: frontend/src/pages/Register.jsx
+================================================================================
+import { useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import { LockKeyhole, Mail, Vault } from 'lucide-react';
+import { useAuth } from '../hooks/useAuth.jsx';
+
+export default function Register() {
+  const { register } = useAuth();
+  const navigate = useNavigate();
+  const [form, setForm] = useState({ username: '', password: '' });
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  async function submit(event) {
+    event.preventDefault();
+    setError('');
+    setLoading(true);
+    try {
+      await register(form.username, form.password);
+      navigate('/dashboard');
+    } catch (err) {
+      setError(err.response?.data?.error || 'Registration failed');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <main className="auth-shell">
+      <section className="auth-panel">
+        <div className="brand-mark"><Vault size={28} /> DocVault</div>
+        <h1>Create your vault</h1>
+        <form onSubmit={submit} className="auth-form">
+          <label>
+            <span>Email</span>
+            <div className="input-row">
+              <Mail size={18} />
+              <input type="email" value={form.username} onChange={(e) => setForm({ ...form, username: e.target.value })} required />
+            </div>
+          </label>
+          <label>
+            <span>Password</span>
+            <div className="input-row">
+              <LockKeyhole size={18} />
+              <input type="password" minLength="8" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} required />
+            </div>
+          </label>
+          {error && <p className="error">{error}</p>}
+          <button className="primary-button" disabled={loading}>{loading ? 'Creating...' : 'Create account'}</button>
+        </form>
+        <p className="auth-link">Already registered? <Link to="/login">Sign in</Link></p>
+      </section>
+    </main>
+  );
+}
+
+********************************************************************************

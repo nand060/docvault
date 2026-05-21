@@ -1,0 +1,26 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg15
+    container_name: docvault-postgres
+    environment:
+      POSTGRES_DB: docvault
+      POSTGRES_USER: docvault
+      POSTGRES_PASSWORD: docvault
+    ports:
+      - "127.0.0.1:15432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U docvault -d docvault"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: docvault-redis
+    ports:
+      - "127.0.0.1:16379:6379"
+
+volumes:
+  postgres_data:

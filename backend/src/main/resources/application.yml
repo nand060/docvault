@@ -1,0 +1,39 @@
+server:
+  address: 127.0.0.1
+  port: 8080
+
+spring:
+  application:
+    name: docvault
+  datasource:
+    url: ${POSTGRES_URL:jdbc:postgresql://127.0.0.1:15432/docvault}
+    username: ${POSTGRES_USER:docvault}
+    password: ${POSTGRES_PASSWORD:docvault}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        format_sql: true
+  flyway:
+    enabled: true
+  servlet:
+    multipart:
+      max-file-size: 1MB
+      max-request-size: 1MB
+
+app:
+  jwt:
+    secret: ${JWT_SECRET}
+    expiration-ms: 86400000
+  files:
+    max-size-bytes: 1048576
+  search:
+    top-k: 5
+  cors:
+    allowed-origins: http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:5174,http://localhost:5174
+  external:
+    huggingface-token: ${HF_API_TOKEN}
+    groq-api-key: ${GROQ_API_KEY}
+    groq-model: ${GROQ_MODEL:llama-3.1-8b-instant}
