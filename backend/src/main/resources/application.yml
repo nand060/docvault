@@ -23,6 +23,11 @@ spring:
       max-file-size: 1MB
       max-request-size: 1MB
 
+search:
+  top-k: 5
+  reranker:
+    threshold: 0.1
+
 app:
   jwt:
     secret: ${JWT_SECRET}

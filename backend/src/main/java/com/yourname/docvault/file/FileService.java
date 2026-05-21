@@ -26,6 +26,7 @@ public class FileService {
     private final FileVectorRepository fileVectorRepository;
     private final UserService userService;
     private final HuggingFaceClient huggingFaceClient;
+    private final FileChunker fileChunker;
     private final SimpMessagingTemplate messagingTemplate;
     private final long maxSizeBytes;
 
@@ -34,6 +35,7 @@ public class FileService {
             FileVectorRepository fileVectorRepository,
             UserService userService,
             HuggingFaceClient huggingFaceClient,
+            FileChunker fileChunker,
             SimpMessagingTemplate messagingTemplate,
             @Value("${app.files.max-size-bytes}") long maxSizeBytes
     ) {
@@ -41,6 +43,7 @@ public class FileService {
         this.fileVectorRepository = fileVectorRepository;
         this.userService = userService;
         this.huggingFaceClient = huggingFaceClient;
+        this.fileChunker = fileChunker;
         this.messagingTemplate = messagingTemplate;
         this.maxSizeBytes = maxSizeBytes;
     }
@@ -58,13 +61,16 @@ public class FileService {
         file.setName(safeName(multipartFile.getOriginalFilename()));
         file.setContent(content);
         FileEntity saved = fileRepository.saveAndFlush(file);
-        sendProgress(userId, "embedding", "Generating embedding");
 
-        List<Double> embedding = huggingFaceClient.embed(content);
-        fileVectorRepository.insertVector(saved.getId(), embedding);
+        List<String> chunks = fileChunker.chunk(content);
+        for (int i = 0; i < chunks.size(); i++) {
+            sendProgress(userId, "embedding", "Generating embeddings... chunk " + (i + 1) + "/" + chunks.size());
+            List<Double> embedding = huggingFaceClient.embed(chunks.get(i));
+            fileVectorRepository.insertVector(saved.getId(), i, chunks.get(i), embedding);
+        }
 
         log.info("Uploaded file {} for user {}", saved.getId(), userId);
-        sendProgress(userId, "done", "Done");
+        sendProgress(userId, "done", "Done ✓");
         return FileResponse.from(saved);
     }
 
@@ -81,6 +87,13 @@ public class FileService {
                 .orElseThrow(() -> new ApiException("File not found", HttpStatus.NOT_FOUND));
         fileRepository.delete(file);
         log.info("Deleted file {} for user {}", fileId, userId);
+    }
+
+    @Transactional(readOnly = true)
+    public FileContentResponse content(Long userId, Long fileId) {
+        FileEntity file = fileRepository.findByIdAndUserId(fileId, userId)
+                .orElseThrow(() -> new ApiException("File not found", HttpStatus.NOT_FOUND));
+        return FileContentResponse.from(file);
     }
 
     private void validateUpload(MultipartFile file) {

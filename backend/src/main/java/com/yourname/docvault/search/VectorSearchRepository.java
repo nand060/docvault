@@ -4,7 +4,9 @@ import com.yourname.docvault.file.FileVectorRepository;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 @Repository
 public class VectorSearchRepository {
@@ -14,26 +16,35 @@ public class VectorSearchRepository {
         this.jdbcTemplate = jdbcTemplate;
     }
 
-    public List<SearchDocument> search(Long userId, List<Double> queryEmbedding, int limit, boolean includeContent) {
-        String contentColumn = includeContent ? "f.content" : "''";
+    public List<SearchDocument> search(Long userId, List<Double> queryEmbedding, int limit) {
         String sql = """
-                SELECT f.id,
+                SELECT fv.file_id,
+                       fv.chunk_text,
                        f.name,
-                       %s AS content,
                        1 - (fv.embedding <=> CAST(? AS vector)) AS similarity_score
                 FROM file_vectors fv
                 JOIN files f ON f.id = fv.file_id
                 WHERE f.user_id = ?
                 ORDER BY fv.embedding <=> CAST(? AS vector)
                 LIMIT ?
-                """.formatted(contentColumn);
+                """;
 
         String vectorLiteral = FileVectorRepository.toVectorLiteral(queryEmbedding);
-        return jdbcTemplate.query(sql, (rs, rowNum) -> new SearchDocument(
-                rs.getLong("id"),
+        List<SearchDocument> chunkCandidates = jdbcTemplate.query(sql, (rs, rowNum) -> new SearchDocument(
+                rs.getLong("file_id"),
                 rs.getString("name"),
-                rs.getString("content"),
+                rs.getString("chunk_text"),
                 rs.getDouble("similarity_score")
-        ), vectorLiteral, userId, vectorLiteral, limit);
+        ), vectorLiteral, userId, vectorLiteral, limit * 3);
+
+        Map<Long, SearchDocument> bestByFile = new LinkedHashMap<>();
+        for (SearchDocument candidate : chunkCandidates) {
+            SearchDocument current = bestByFile.get(candidate.id());
+            if (current == null || candidate.similarityScore() > current.similarityScore()) {
+                bestByFile.put(candidate.id(), candidate);
+            }
+        }
+
+        return bestByFile.values().stream().limit(limit).toList();
     }
 }

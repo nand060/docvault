@@ -13,12 +13,21 @@ public class FileVectorRepository {
         this.jdbcTemplate = jdbcTemplate;
     }
 
-    public void insertVector(Long fileId, List<Double> embedding) {
+    public void insertVector(Long fileId, int chunkIndex, String chunkText, List<Double> embedding) {
         jdbcTemplate.update(
-                "INSERT INTO file_vectors (file_id, embedding) VALUES (?, CAST(? AS vector))",
+                """
+                        INSERT INTO file_vectors (file_id, chunk_index, chunk_text, embedding)
+                        VALUES (?, ?, ?, CAST(? AS vector))
+                        """,
                 fileId,
+                chunkIndex,
+                chunkText,
                 toVectorLiteral(embedding)
         );
+    }
+
+    public void deleteByFileId(Long fileId) {
+        jdbcTemplate.update("DELETE FROM file_vectors WHERE file_id = ?", fileId);
     }
 
     public static String toVectorLiteral(List<Double> embedding) {

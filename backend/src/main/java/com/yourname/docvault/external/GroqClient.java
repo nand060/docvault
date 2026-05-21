@@ -40,13 +40,23 @@ public class GroqClient {
     }
 
     public void streamSummary(String query, List<SearchDocument> documents, Consumer<String> tokenConsumer) {
-        String systemPrompt = "You are a document assistant. The user asked: `" + query
-                + "`. The following documents were retrieved as relevant. "
-                + "Summarize what they say in relation to the user's query.";
+        String systemPrompt = """
+                You are a document assistant. The user asked: %s.
+                The following document chunks were retrieved as the most relevant passages from the user's files.
+                Your task:
+
+                If the retrieved passages directly address the query, summarize what they say in relation to it.
+                If the retrieved passages are only tangentially related or do not clearly answer the query, say so explicitly at the start: "The documents do not directly address this query, but here is what they contain that may be relevant:" and then summarize.
+                Do NOT invent information not present in the provided passages.
+                Do NOT summarize content unrelated to the query unless you have declared it tangential per rule 2.
+                """.formatted(query);
 
         StringBuilder userPrompt = new StringBuilder();
         for (SearchDocument document : documents) {
-            userPrompt.append("Document: ").append(document.name()).append("\n")
+            userPrompt.append("Document: ").append(document.name())
+                    .append(" (relevance: ")
+                    .append(Math.round(document.similarityScore() * 100))
+                    .append("%)\n")
                     .append(document.content()).append("\n\n");
         }
 

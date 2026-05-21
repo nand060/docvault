@@ -34,6 +34,11 @@ public class FileController {
         return fileService.list(principal.id());
     }
 
+    @GetMapping("/{id}/content")
+    public FileContentResponse content(@CurrentUser UserPrincipal principal, @PathVariable Long id) {
+        return fileService.content(principal.id(), id);
+    }
+
     @DeleteMapping("/{id}")
     @ResponseStatus(HttpStatus.NO_CONTENT)
     public void delete(@CurrentUser UserPrincipal principal, @PathVariable Long id) {

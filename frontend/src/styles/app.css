@@ -182,7 +182,7 @@ a {
     var(--paper);
 }
 
-.topbar {
+.top-bar {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -191,13 +191,37 @@ a {
   margin: 0 auto 24px;
 }
 
-.topbar p {
+.top-bar p {
   display: flex;
   align-items: center;
   gap: 7px;
   margin: 8px 0 0;
   color: var(--muted);
   font-size: 14px;
+}
+
+.search-bar-container {
+  flex: 1;
+  max-width: 640px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+}
+
+.search-bar-container input {
+  min-height: 48px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  padding: 0 14px;
+  color: var(--ink);
+  outline: 0;
+  transition: border-color 160ms ease, box-shadow 160ms ease;
+}
+
+.search-bar-container input:focus {
+  border-color: var(--teal);
+  box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.1);
 }
 
 .ghost-button {
@@ -231,6 +255,37 @@ a {
 
 .search-panel {
   grid-column: 1 / -1;
+}
+
+.results-area {
+  max-width: 1240px;
+  margin: 0 auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 10px 32px rgba(23, 32, 27, 0.07);
+  padding: 22px;
+}
+
+.results-header {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+
+.back-button {
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 13px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--ink);
+  font-weight: 800;
 }
 
 .panel-header {
@@ -329,9 +384,28 @@ a {
 }
 
 .file-row strong,
-.ranked-row strong {
+.ranked-row strong,
+.file-name-button,
+.ranked-row button {
   display: block;
   overflow-wrap: anywhere;
+}
+
+.file-name-button,
+.ranked-row button,
+.mini-results button {
+  border: 0;
+  background: transparent;
+  color: var(--teal);
+  font-weight: 900;
+  text-align: left;
+  padding: 0;
+}
+
+.file-name-button:hover,
+.ranked-row button:hover,
+.mini-results button:hover {
+  text-decoration: underline;
 }
 
 .file-row time {
@@ -429,7 +503,7 @@ a {
   margin-bottom: 14px;
 }
 
-.mini-results span {
+.mini-results button {
   max-width: 240px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -446,6 +520,92 @@ a {
   white-space: pre-wrap;
   line-height: 1.65;
   font-size: 16px;
+  margin-bottom: 16px;
+}
+
+.empty-search-state {
+  gap: 9px;
+  text-align: center;
+}
+
+.empty-search-state svg {
+  color: var(--teal);
+}
+
+.empty-search-state span {
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.file-modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 22px;
+  background: rgba(23, 32, 27, 0.45);
+}
+
+.file-modal {
+  width: min(900px, 100%);
+  max-height: min(760px, 88vh);
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+}
+
+.file-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 18px 20px;
+  border-bottom: 1px solid var(--line);
+}
+
+.file-modal-header h2 {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 24px;
+}
+
+.file-modal-body {
+  min-height: 260px;
+  overflow: auto;
+  padding: 20px;
+}
+
+.file-modal-body pre {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  line-height: 1.55;
+}
+
+.file-modal-close {
+  width: 38px;
+  height: 38px;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--ink);
+}
+
+.modal-state {
+  min-height: 180px;
+  display: grid;
+  place-items: center;
+  gap: 10px;
+  color: var(--muted);
+  font-weight: 800;
 }
 
 .spin {
@@ -463,18 +623,22 @@ a {
     padding: 18px;
   }
 
-  .topbar,
+  .top-bar,
   .dashboard-grid,
-  .search-form {
+  .search-form,
+  .search-bar-container,
+  .results-header {
     grid-template-columns: 1fr;
   }
 
-  .topbar {
+  .top-bar {
     align-items: flex-start;
+    flex-direction: column;
   }
 
-  .search-panel {
-    grid-column: auto;
+  .search-bar-container {
+    width: 100%;
+    max-width: none;
   }
 
   .panel-header {
