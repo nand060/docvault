@@ -16,6 +16,9 @@ import org.springframework.transaction.annotation.Transactional;
 import java.util.List;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Arrays;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 @Service
 public class SearchService {
@@ -58,8 +61,8 @@ public class SearchService {
 
         boolean aiMode = user.isAiAccess();
         send(userId, "status", "Searching your files");
-        List<SearchDocument> documents = vectorSearchRepository.search(userId, queryEmbedding, topK);
-        documents = rerankAndFilter(query, documents, rerankerThreshold);
+        List<SearchDocument> documents = vectorSearchRepository.search(userId, query, queryEmbedding, topK);
+        documents = rerankAndFilter(query, documents, rerankerThreshold).stream().limit(topK).toList();
         List<SearchResult> results = documents.stream().map(SearchDocument::toResult).toList();
 
         if (documents.isEmpty()) {
@@ -97,13 +100,66 @@ public class SearchService {
         for (int i = 0; i < documents.size(); i++) {
             double score = i < scores.size() ? scores.get(i) : 0.0;
             SearchDocument document = documents.get(i);
+            if (score < threshold && hasExactTermMatch(query, document.content())) {
+                log.info("Keeping document '{}' because it contains an exact query term match despite reranker score {}",
+                        document.name(), score);
+                score = threshold;
+            }
+            SearchDocument scoredDocument = new SearchDocument(document.id(), document.name(), document.content(), score);
             if (score >= threshold) {
-                reranked.add(new SearchDocument(document.id(), document.name(), document.content(), score));
+                reranked.add(scoredDocument);
+            } else {
+                log.info("Filtered out document '{}' with reranker score {}", scoredDocument.name(), scoredDocument.similarityScore());
             }
         }
         reranked.sort(Comparator.comparingDouble(SearchDocument::similarityScore).reversed());
+        log.info("Documents passing reranker threshold: {}", reranked.stream()
+                .map(document -> document.name() + "=" + document.similarityScore())
+                .toList());
         return reranked;
     }
+
+    private boolean hasExactTermMatch(String query, String content) {
+        Set<String> contentTerms = terms(content);
+        if (contentTerms.isEmpty()) {
+            return false;
+        }
+        List<String> queryTerms = terms(query).stream().toList();
+        return !queryTerms.isEmpty() && queryTerms.stream().anyMatch(contentTerms::contains);
+    }
+
+    private Set<String> terms(String text) {
+        if (text == null || text.isBlank()) {
+            return Set.of();
+        }
+        return Arrays.stream(text.toLowerCase().split("[^a-z0-9]+"))
+                .map(this::normalizeTerm)
+                .filter(term -> term.length() > 2)
+                .filter(term -> !STOPWORDS.contains(term))
+                .collect(Collectors.toSet());
+    }
+
+    private String normalizeTerm(String term) {
+        if (term.endsWith("ied") && term.length() > 3) {
+            return term.substring(0, term.length() - 3) + "ie";
+        }
+        if (term.endsWith("ed") && term.length() > 4) {
+            return term.substring(0, term.length() - 2);
+        }
+        if (term.endsWith("ing") && term.length() > 5) {
+            return term.substring(0, term.length() - 3);
+        }
+        if (term.endsWith("s") && term.length() > 3) {
+            return term.substring(0, term.length() - 1);
+        }
+        return term;
+    }
+
+    private static final Set<String> STOPWORDS = Set.of(
+            "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "do", "does", "for", "from",
+            "did", "how", "i", "in", "is", "it", "me", "my", "of", "on", "or", "please", "tell", "that", "the",
+            "this", "to", "was", "what", "when", "where", "who", "why", "with", "would", "you"
+    );
 
     private void send(Long userId, String type, Object payload) {
         messagingTemplate.convertAndSend(

@@ -45,10 +45,13 @@ public class GroqClient {
                 The following document chunks were retrieved as the most relevant passages from the user's files.
                 Your task:
 
-                If the retrieved passages directly address the query, summarize what they say in relation to it.
-                If the retrieved passages are only tangentially related or do not clearly answer the query, say so explicitly at the start: "The documents do not directly address this query, but here is what they contain that may be relevant:" and then summarize.
+                Give a detailed, grounded answer using only the retrieved passages.
+                If the query asks about a name, entity, phrase, or topic that appears in the passages, treat those passages as relevant and explain everything the documents say about it.
+                When multiple documents are provided, compare and combine what each document says. Mention which document each key detail came from when useful.
+                If a passage gives only partial context, say what is known from the passage and what is not stated.
+                Use clear paragraphs or bullets. Prefer a fuller answer over a one-sentence summary.
                 Do NOT invent information not present in the provided passages.
-                Do NOT summarize content unrelated to the query unless you have declared it tangential per rule 2.
+                Do NOT add the phrase "The documents do not directly address this query" 
                 """.formatted(query);
 
         StringBuilder userPrompt = new StringBuilder();
@@ -63,6 +66,8 @@ public class GroqClient {
         Map<String, Object> body = Map.of(
                 "model", model,
                 "stream", true,
+                "temperature", 0.2,
+                "max_tokens", 900,
                 "messages", List.of(
                         Map.of("role", "system", "content", systemPrompt),
                         Map.of("role", "user", "content", userPrompt.toString())
