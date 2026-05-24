@@ -49,6 +49,7 @@ export function AuthProvider({ children }) {
     });
   }
 
+  // CHECK IF NEEDED
   function updateUser(nextUser) {
     setUser(nextUser);
     localStorage.setItem('docvault.user', JSON.stringify(nextUser));
