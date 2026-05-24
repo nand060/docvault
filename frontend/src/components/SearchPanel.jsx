@@ -1,4 +1,5 @@
 import { ArrowLeft, Search, SearchX, Sparkles } from 'lucide-react';
+import { sanitizeFilename, sanitizeText } from '../utils/sanitize';
 
 export default function SearchPanel({ aiAccess, events, socketReady, loading, error, message, onBack, onOpenFile }) {
   return (
@@ -16,10 +17,10 @@ export default function SearchPanel({ aiAccess, events, socketReady, loading, er
 }
 
 function SearchOutput({ aiAccess, events, loading, message, onOpenFile }) {
-  const status = [...events].reverse().find((event) => event.type === 'status')?.payload;
-  const done = [...events].reverse().find((event) => event.type === 'done')?.payload;
+  const status = sanitizeText([...events].reverse().find((event) => event.type === 'status')?.payload);
+  const done = sanitizeText([...events].reverse().find((event) => event.type === 'done')?.payload);
   const resultsEvent = [...events].reverse().find((event) => event.type === 'results' || event.type === 'ai-start');
-  const tokens = events.filter((event) => event.type === 'ai-token').map((event) => event.payload).join('');
+  const tokens = sanitizeText(events.filter((event) => event.type === 'ai-token').map((event) => event.payload).join(''));
   const noMatches = message === 'No documents matched your query.' || done === 'No documents matched your query.';
 
   if (events.length === 0) {
@@ -44,7 +45,7 @@ function SearchOutput({ aiAccess, events, loading, message, onOpenFile }) {
         {resultsEvent?.payload?.length > 0 && (
           <div className="mini-results">
             {resultsEvent.payload.map((result) => (
-              <button key={result.id} onClick={() => onOpenFile(result.id)}>{result.name}</button>
+              <button key={result.id} onClick={() => onOpenFile(result.id)}>{sanitizeFilename(result.name)}</button>
             ))}
           </div>
         )}
@@ -63,8 +64,8 @@ function SearchOutput({ aiAccess, events, loading, message, onOpenFile }) {
         {(resultsEvent?.payload || []).map((result, index) => (
           <article key={result.id} className="ranked-row">
             <span>{index + 1}</span>
-            <button onClick={() => onOpenFile(result.id)}>{result.name}</button>
-            <em>{Math.max(result.similarityScore, 0).toFixed(3)}</em>
+            <button onClick={() => onOpenFile(result.id)}>{sanitizeFilename(result.name)}</button>
+            {/*<em>{Math.max(result.similarityScore, 0).toFixed(3)}</em>*/}
           </article>
         ))}
       </div>
@@ -77,7 +78,7 @@ function EmptySearchState() {
     <div className="search-output idle empty-search-state">
       <SearchX size={32} />
       <strong>No documents matched your query.</strong>
-      <span>Try a more specific term from one of your uploaded files.</span>
+      <span>Try a more specific term from one of your uploaded files or check your spelling.</span>
     </div>
   );
 }

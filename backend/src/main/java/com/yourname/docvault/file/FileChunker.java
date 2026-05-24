@@ -10,8 +10,8 @@ import java.util.List;
 @Component
 public class FileChunker {
     private static final Logger log = LoggerFactory.getLogger(FileChunker.class);
-    static final int CHUNK_WORDS = 300;
-    static final int OVERLAP_WORDS = 50;
+    static final int CHUNK_WORDS = 180;
+    static final int OVERLAP_WORDS = 30;
 
     public List<String> chunk(String text) {
         if (text == null || text.isBlank()) {

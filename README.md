@@ -38,7 +38,6 @@ HF_API_TOKEN=<your HuggingFace token>
 GROQ_API_KEY=<your Groq API key>
 GROQ_MODEL=llama-3.1-8b-instant
 ```
-
 A 256-bit JWT secret can be generated with:
 
 ```bash

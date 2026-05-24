@@ -148,8 +148,8 @@ public class VectorSearchRepository {
             }
         }
 
-        int start = Math.max(0, wordIndex - 150);
-        int end = Math.min(words.length, wordIndex + 150);
+        int start = Math.max(0, wordIndex - 90);
+        int end = Math.min(words.length, wordIndex + 90);
         return String.join(" ", Arrays.copyOfRange(words, start, end));
     }
 

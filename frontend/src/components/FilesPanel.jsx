@@ -1,5 +1,6 @@
 import { Brain, Trash2 } from 'lucide-react';
 import api from '../api/client';
+import { sanitizeFilename } from '../utils/sanitize';
 
 export default function FilesPanel({ files, aiAccess, onToggleAi, onDeleted, onOpenFile }) {
   async function remove(fileId) {
@@ -21,7 +22,7 @@ export default function FilesPanel({ files, aiAccess, onToggleAi, onDeleted, onO
         {files.map((file) => (
           <article className="file-row" key={file.id}>
             <div>
-              <button className="file-name-button" onClick={() => onOpenFile(file.id)}>{file.name}</button>
+              <button className="file-name-button" onClick={() => onOpenFile(file.id)}>{sanitizeFilename(file.name)}</button>
               <time>{new Date(file.uploadedAt).toLocaleString()}</time>
             </div>
             <button className="icon-button danger" title="Delete file" onClick={() => remove(file.id)}>

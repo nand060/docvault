@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react';
 import { FileUp, Loader2 } from 'lucide-react';
 import api from '../api/client';
+import { sanitizeText } from '../utils/sanitize';
 
 export default function UploadPanel({ progress, onUploaded }) {
   const inputRef = useRef(null);
@@ -57,8 +58,8 @@ export default function UploadPanel({ progress, onUploaded }) {
         <span>{uploading ? 'Working...' : 'Drop a text file'}</span>
       </button>
       <input ref={inputRef} className="hidden-input" type="file" accept=".txt,text/plain" onChange={(event) => upload(event.target.files[0])} />
-      <div className="status-strip">{progress || 'Ready'}</div>
-      {error && <p className="error">{error}</p>}
+      <div className="status-strip">{sanitizeText(progress) || 'Ready'}</div>
+      {error && <p className="error">{sanitizeText(error)}</p>}
     </section>
   );
 }

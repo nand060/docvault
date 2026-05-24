@@ -6,6 +6,7 @@ import { createStompClient } from '../websocket/stompClient';
 import UploadPanel from '../components/UploadPanel.jsx';
 import FilesPanel from '../components/FilesPanel.jsx';
 import SearchPanel from '../components/SearchPanel.jsx';
+import { sanitizeFilename, sanitizeText } from '../utils/sanitize';
 
 export default function Dashboard() {
   const { token, user, logout, updateUser } = useAuth();
@@ -30,7 +31,7 @@ export default function Dashboard() {
       setSocketReady(true);
       client.subscribe(`/topic/upload-progress/${connectedUserId}`, (message) => {
         const event = JSON.parse(message.body);
-        setUploadProgress(event.payload);
+        setUploadProgress(sanitizeText(event.payload));
       });
       client.subscribe(`/topic/search-results/${connectedUserId}`, (message) => {
         const event = JSON.parse(message.body);
@@ -105,7 +106,7 @@ export default function Dashboard() {
         setSearchEvents([{ type: 'results', payload: response.data.results || [] }]);
       }
     } catch (err) {
-      setSearchError(err.response?.data?.error || 'Search failed');
+      setSearchError(sanitizeText(err.response?.data?.error || 'Search failed'));
     } finally {
       setSearchLoading(false);
     }
@@ -128,7 +129,7 @@ export default function Dashboard() {
       setFileModal({
         open: true,
         loading: false,
-        error: err.response?.data?.error || 'Could not load file content',
+        error: sanitizeText(err.response?.data?.error || 'Could not load file content'),
         file: null
       });
     }
@@ -197,15 +198,15 @@ function FileContentModal({ modal, onClose }) {
     <div className="file-modal-overlay" onMouseDown={onClose}>
       <section className="file-modal" onMouseDown={(event) => event.stopPropagation()}>
         <header className="file-modal-header">
-          <h2>{modal.file?.name || 'File content'}</h2>
+          <h2>{modal.file?.name ? sanitizeFilename(modal.file.name) : 'File content'}</h2>
           <button className="file-modal-close" onClick={onClose} aria-label="Close file content">
             <X size={20} />
           </button>
         </header>
         <div className="file-modal-body">
           {modal.loading && <div className="modal-state"><Loader2 className="spin" /> Loading content...</div>}
-          {modal.error && <p className="error">{modal.error}</p>}
-          {modal.file && <pre>{modal.file.content}</pre>}
+          {modal.error && <p className="error">{sanitizeText(modal.error)}</p>}
+          {modal.file && <pre>{sanitizeText(modal.file.content ?? '')}</pre>}
         </div>
       </section>
     </div>
